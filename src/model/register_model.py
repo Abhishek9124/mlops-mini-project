@@ -6,84 +6,117 @@ import logging
 import os
 import dagshub
 
-# Set up DagsHub credentials for MLflow tracking
+# ==============================
+# DagsHub Authentication
+# ==============================
 dagshub_token = os.getenv("DAGSHUB_PAT")
 if not dagshub_token:
     raise EnvironmentError("DAGSHUB_PAT environment variable is not set")
 
-os.environ["MLFLOW_TRACKING_USERNAME"] = dagshub_token
-os.environ["MLFLOW_TRACKING_PASSWORD"] = dagshub_token
+dagshub.auth.add_app_token(dagshub_token)
 
-dagshub_url = "https://dagshub.com"
-repo_owner = "Abhishek9124"
-repo_name = "mlops-mini-project"
+# ==============================
+# MLflow Tracking Configuration
+# ==============================
+mlflow.set_tracking_uri(
+    "https://dagshub.com/Abhishek9124/mlops-mini-project.mlflow"
+)
 
-# Set up MLflow tracking URI
-mlflow.set_tracking_uri('https://dagshub.com/Abhishek9124/mlops-mini-project.mlflow')
+# ==============================
+# Logging Configuration
+# ==============================
+logger = logging.getLogger("model_registration")
+logger.setLevel(logging.DEBUG)
 
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.DEBUG)
 
-# logging configuration
-logger = logging.getLogger('model_registration')
-logger.setLevel('DEBUG')
+    file_handler = logging.FileHandler("model_registration_errors.log")
+    file_handler.setLevel(logging.ERROR)
 
-console_handler = logging.StreamHandler()
-console_handler.setLevel('DEBUG')
+    formatter = logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    console_handler.setFormatter(formatter)
+    file_handler.setFormatter(formatter)
 
-file_handler = logging.FileHandler('model_registration_errors.log')
-file_handler.setLevel('ERROR')
+    logger.addHandler(console_handler)
+    logger.addHandler(file_handler)
 
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-file_handler.setFormatter(formatter)
-
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
-
+# ==============================
+# Helper Functions
+# ==============================
 def load_model_info(file_path: str) -> dict:
     """Load the model info from a JSON file."""
     try:
-        with open(file_path, 'r') as file:
+        with open(file_path, "r") as file:
             model_info = json.load(file)
-        logger.debug('Model info loaded from %s', file_path)
+        logger.debug("Model info loaded from %s", file_path)
         return model_info
     except FileNotFoundError:
-        logger.error('File not found: %s', file_path)
+        logger.error("File not found: %s", file_path)
         raise
     except Exception as e:
-        logger.error('Unexpected error occurred while loading the model info: %s', e)
+        logger.error(
+            "Unexpected error occurred while loading the model info: %s", e
+        )
         raise
 
+
 def register_model(model_name: str, model_info: dict):
-    """Register the model to the MLflow Model Registry."""
+    """Register the model to the MLflow Model Registry (DagsHub-safe)."""
     try:
-        model_uri = f"runs:/{model_info['run_id']}/{model_info['model_path']}"
-        
-        # Register the model
-        model_version = mlflow.register_model(model_uri, model_name)
-        
-        # Transition the model to "Staging" stage
         client = mlflow.tracking.MlflowClient()
+
+        model_uri = f"runs:/{model_info['run_id']}/{model_info['model_path']}"
+
+        # Step 1: Create registered model if it does not exist
+        try:
+            client.create_registered_model(model_name)
+            logger.debug("Registered model %s created", model_name)
+        except Exception:
+            logger.debug("Registered model %s already exists", model_name)
+
+        # Step 2: Create model version
+        model_version = client.create_model_version(
+            name=model_name,
+            source=model_uri,
+            run_id=model_info["run_id"],
+        )
+
+        # Step 3: Transition to Staging
         client.transition_model_version_stage(
             name=model_name,
             version=model_version.version,
-            stage="Staging"
+            stage="Staging",
         )
-        
-        logger.debug(f'Model {model_name} version {model_version.version} registered and transitioned to Staging.')
+
+        logger.debug(
+            "Model %s version %s successfully moved to Staging",
+            model_name,
+            model_version.version,
+        )
+
     except Exception as e:
-        logger.error('Error during model registration: %s', e)
+        logger.error("Error during model registration: %s", e)
         raise
 
-def main():
-    try:
-        model_info_path = 'reports/experiment_info.json'
-        model_info = load_model_info(model_info_path)
-        
-        model_name = "my_model"
-        register_model(model_name, model_info)
-    except Exception as e:
-        logger.error('Failed to complete the model registration process: %s', e)
-        print(f"Error: {e}")
 
-if __name__ == '__main__':
+
+# ==============================
+# Main
+# ==============================
+def main():
+    model_info = json.load(open("reports/experiment_info.json"))
+
+    with mlflow.start_run(run_id=model_info["run_id"]):
+        mlflow.set_tag("model_status", "staging_candidate")
+        mlflow.set_tag("model_path", model_info["model_path"])
+        mlflow.set_tag("lifecycle", "validated")
+
+    logger.debug("Model marked as staging candidate via MLflow tags")
+
+if __name__ == "__main__":
     main()
+

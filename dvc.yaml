@@ -12,7 +12,7 @@ stages:
 
   data_preprocessing:
     cmd: python src/data/data_preprocessing.py
-    deps:
+    deps: 
     - data/raw
     - src/data/data_preprocessing.py
     outs:
