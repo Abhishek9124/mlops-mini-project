@@ -1,26 +1,28 @@
-# register model
+"""
+Model Registration Script (Corrected)
+-------------------------------------
+- robust authentication using dagshub.init()
+- handles model version creation and staging promotion
+- explicit error handling for MLflow
+- Handles missing 'model_name' in experiment info
+"""
 
 import json
-import mlflow
 import logging
 import os
+import time
 import dagshub
+import mlflow
+from mlflow.tracking import MlflowClient
+from mlflow.exceptions import MlflowException
 
 # ==============================
-# DagsHub Authentication
+# Configuration
 # ==============================
-dagshub_token = os.getenv("DAGSHUB_PAT")
-if not dagshub_token:
-    raise EnvironmentError("DAGSHUB_PAT environment variable is not set")
-
-dagshub.auth.add_app_token(dagshub_token)
-
-# ==============================
-# MLflow Tracking Configuration
-# ==============================
-mlflow.set_tracking_uri(
-    "https://dagshub.com/Abhishek9124/mlops-mini-project.mlflow"
-)
+REPO_OWNER = "Abhishek9124"
+REPO_NAME = "mlops-mini-project"
+EXPERIMENT_INFO_PATH = "reports/experiment_info.json"
+DEFAULT_MODEL_NAME = "mlops_model"  # Fallback name if missing in JSON
 
 # ==============================
 # Logging Configuration
@@ -30,93 +32,133 @@ logger.setLevel(logging.DEBUG)
 
 if not logger.handlers:
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-
-    file_handler = logging.FileHandler("model_registration_errors.log")
-    file_handler.setLevel(logging.ERROR)
-
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     console_handler.setFormatter(formatter)
-    file_handler.setFormatter(formatter)
-
     logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
 
 # ==============================
 # Helper Functions
 # ==============================
 def load_model_info(file_path: str) -> dict:
-    """Load the model info from a JSON file."""
+    """Load model metadata saved during training."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Experiment info file not found at: {file_path}")
+        
     try:
-        with open(file_path, "r") as file:
-            model_info = json.load(file)
-        logger.debug("Model info loaded from %s", file_path)
+        with open(file_path, "r") as f:
+            model_info = json.load(f)
+        logger.info(f"Loaded model info from {file_path}")
+        
+        # Debug: Print keys to help user identify what is missing
+        logger.debug(f"Keys found in experiment info: {list(model_info.keys())}")
+        
         return model_info
-    except FileNotFoundError:
-        logger.error("File not found: %s", file_path)
-        raise
     except Exception as e:
-        logger.error(
-            "Unexpected error occurred while loading the model info: %s", e
-        )
+        logger.error(f"Failed to load model info: {e}")
         raise
 
+def wait_for_version_ready(client, name, version, max_retries=10):
+    """Wait for the model version to be ready before transitioning."""
+    for _ in range(max_retries):
+        model_version_details = client.get_model_version(name=name, version=version)
+        status = model_version_details.status
+        if status == "READY":
+            return True
+        logger.info(f"Model version status: {status}. Waiting...")
+        time.sleep(1)
+    return False
 
 def register_model(model_name: str, model_info: dict):
-    """Register the model to the MLflow Model Registry (DagsHub-safe)."""
+    """
+    Register model in MLflow Model Registry and promote to STAGING.
+    """
+    client = MlflowClient()
+    
+    # Construct the run URI
+    # Default to 'model' if model_path is missing
+    model_path = model_info.get('model_path', 'model')
+    clean_path = model_path.lstrip('/')
+    
+    if 'run_id' not in model_info:
+        raise KeyError("Critical error: 'run_id' missing from experiment info.")
+        
+    model_uri = f"runs:/{model_info['run_id']}/{clean_path}"
+
+    # 1. Create Registered Model
     try:
-        client = mlflow.tracking.MlflowClient()
+        client.create_registered_model(model_name)
+        logger.info(f"Created new registered model: {model_name}")
+    except MlflowException as e:
+        # Check if error is "Resource already exists"
+        if "RESOURCE_ALREADY_EXISTS" in str(e) or "already exists" in str(e).lower():
+            logger.info(f"Registered model '{model_name}' already exists.")
+        else:
+            logger.error(f"Error creating registered model: {e}")
+            raise
 
-        model_uri = f"runs:/{model_info['run_id']}/{model_info['model_path']}"
-
-        # Step 1: Create registered model if it does not exist
-        try:
-            client.create_registered_model(model_name)
-            logger.debug("Registered model %s created", model_name)
-        except Exception:
-            logger.debug("Registered model %s already exists", model_name)
-
-        # Step 2: Create model version
+    # 2. Create Model Version
+    try:
         model_version = client.create_model_version(
             name=model_name,
             source=model_uri,
             run_id=model_info["run_id"],
         )
+        logger.info(f"Created version {model_version.version} for model {model_name}")
+    except MlflowException as e:
+        logger.error(f"Failed to create model version: {e}")
+        raise
 
-        # Step 3: Transition to Staging
+    # 3. Wait for Ready state (Critical for DagsHub/Remote backends)
+    if not wait_for_version_ready(client, model_name, model_version.version):
+        logger.warning("Model version not ready. Skipping stage transition.")
+        return
+
+    # 4. Promote to STAGING
+    try:
         client.transition_model_version_stage(
             name=model_name,
             version=model_version.version,
             stage="Staging",
+            archive_existing_versions=True,
         )
-
-        logger.debug(
-            "Model %s version %s successfully moved to Staging",
-            model_name,
-            model_version.version,
-        )
-
-    except Exception as e:
-        logger.error("Error during model registration: %s", e)
+        logger.info(f"Model {model_name} version {model_version.version} promoted to STAGING")
+    except MlflowException as e:
+        logger.error(f"Failed to transition model stage: {e}")
         raise
-
-
 
 # ==============================
 # Main
 # ==============================
 def main():
-    model_info = json.load(open("reports/experiment_info.json"))
+    # 1. Initialize DagsHub (Handles Auth & Tracking URI automatically)
+    try:
+        dagshub.init(repo_owner=REPO_OWNER, repo_name=REPO_NAME, mlflow=True)
+    except Exception as e:
+        logger.error("Failed to initialize DagsHub. Check your internet or Repo details.")
+        raise e
 
-    with mlflow.start_run(run_id=model_info["run_id"]):
-        mlflow.set_tag("model_status", "staging_candidate")
-        mlflow.set_tag("model_path", model_info["model_path"])
-        mlflow.set_tag("lifecycle", "validated")
+    # 2. Load Info
+    model_info = load_model_info(EXPERIMENT_INFO_PATH)
+    
+    # Determine Model Name (Fallback to default if missing)
+    model_name = model_info.get("model_name", DEFAULT_MODEL_NAME)
+    if "model_name" not in model_info:
+        logger.warning(f"'model_name' not found in {EXPERIMENT_INFO_PATH}. Using default: {model_name}")
 
-    logger.debug("Model marked as staging candidate via MLflow tags")
+    # 3. Log Registration Event (Optional separate run)
+    with mlflow.start_run(run_name="model_registration") as run:
+        mlflow.set_tag("event", "model_registration")
+        mlflow.set_tag("target_model", model_name)
+        mlflow.set_tag("source_run_id", model_info.get("run_id", "unknown"))
+        
+        logger.info(f"Registration event logged in run: {run.info.run_id}")
+
+    # 4. Perform Registration
+    register_model(
+        model_name=model_name,
+        model_info=model_info,
+    )
 
 if __name__ == "__main__":
     main()
-
