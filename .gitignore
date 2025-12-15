@@ -4,7 +4,7 @@ __pycache__/
 
 # C extensions
 *.so
-mlops-env
+mlops-env/
 # Distribution / packaging
 .Python
 env/
