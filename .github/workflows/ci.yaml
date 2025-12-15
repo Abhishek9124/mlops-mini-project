@@ -8,7 +8,7 @@ jobs:
 
     steps:
       - name: checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v2
 
       - name: setup python
         uses: actions/setup-python@v2
@@ -18,5 +18,5 @@ jobs:
       - name: install dependencies
         run: pip install -r requirements.txt
 
-      - name: run pipeline 
+      - name: run pipeline
         run: dvc repro
